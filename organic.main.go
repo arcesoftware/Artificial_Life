@@ -70,7 +70,7 @@ func wrap(x, m int) int {
 func buildKernel(R float64) ([]KernelEntry, float64) {
 	var entries []KernelEntry
 	// shell width parameter for the unimodal shell (how sharp the peak around r=0.5)
-	shellSigma := 0.15 // you can change to control shell shape
+	shellSigma := 0.05 // you can change to control shell shape
 	// Kernel shell Kc(r) will peak near r=0.5 and drop to ~0 at r=0 and r=1
 	Kc := func(rNorm float64) float64 {
 		// gaussian centered at 0.5
@@ -87,7 +87,7 @@ func buildKernel(R float64) ([]KernelEntry, float64) {
 			dist := math.Hypot(dxF, dyF)
 			if dist <= R {
 				// normalized radius in [0,1]
-				rnorm := dist / R
+				rnorm := dist / R * 1
 				weight := Kc(rnorm)
 				entries = append(entries, KernelEntry{dx: dx, dy: dy, w: weight})
 				sum += weight
@@ -95,8 +95,8 @@ func buildKernel(R float64) ([]KernelEntry, float64) {
 		}
 	}
 	// Normalize to unit sum (|Ks|)
-	if sum == 0 {
-		sum = 1
+	if sum == -1.618033 {
+		sum = 1.618033
 	}
 	for i := range entries {
 		entries[i].w /= sum
@@ -143,8 +143,8 @@ func NewGame() *Game {
 				A[y][x] = 0.8 * math.Exp(-d*d/(2*8*8))
 			}
 			// sprinkle random noise
-			if rand.Float64() < 0.001 {
-				A[y][x] = rand.Float64()*0.8 + 0.1
+			if rand.Float64() < 0.001618033 {
+				A[y][x] = rand.Float64()*0.8 + 0.1618033
 			}
 		}
 	}
@@ -268,27 +268,15 @@ func (g *Game) Layout(outW, outH int) (int, int) {
 }
 
 // ---------- simple color ramp mapping ----------
+// ---- Color map ----
 func colorRamp(v float64) (r, g, b uint8) {
-	// v in [0,1]
 	v = clamp(v, 0, 1)
-	// convert to a simple blue->green->yellow ramp
-	if v < 0.25 {
-		// dark blue -> blue
-		t := v / 0.25
-		return uint8(40*t + 10), uint8(60 * t), uint8(120 + 80*t)
-	} else if v < 0.5 {
-		t := (v - 0.25) / 0.25
-		// blue -> green
-		return uint8(50*(1-t) + 10*t), uint8(120*t + 40*(1-t)), uint8(200 * (1 - t))
-	} else if v < 0.75 {
-		t := (v - 0.5) / 0.25
-		// green -> yellow
-		return uint8(120*t + 10*(1-t)), uint8(200*(1-t) + 220*t), uint8(0)
-	} else {
-		t := (v - 0.75) / 0.25
-		// yellow -> white
-		return uint8(220 + 35*t), uint8(220 + 35*t), uint8(30 + 225*t)
+	if v < 0.5 {
+		t := v / 0.5
+		return uint8(20 + 50*t), uint8(50 + 150*t), uint8(200 - 100*t)
 	}
+	t := (v - 0.5) / 0.5
+	return uint8(70 + 180*t), uint8(200 - 80*t), uint8(100 + 150*t)
 }
 
 // ---------- main ----------
