@@ -1,0 +1,767 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tri-Sphere TDA Dynamics</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Load Three.js (a simple, modern 3D library) -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <style>
+        /* General styling for the 3D canvas */
+        body { margin: 0; overflow: hidden; font-family: 'Inter', sans-serif; }
+        #simulation-container {
+            width: 100vw;
+            height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            background-color: #0d0d1a; /* Dark background matching the Go-GL setup */
+        }
+        .info-panel {
+            position: absolute;
+            top: 0;
+            left: 0;
+            padding: 1rem;
+            color: #d1d5db;
+            font-size: 0.875rem;
+            background-color: rgba(13, 13, 26, 0.8);
+            border-bottom-right-radius: 0.5rem;
+            z-index: 10;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+    </style>
+</head>
+<body>
+
+<div id="simulation-container">
+    <div class="info-panel">
+        <p class="font-bold text-lg mb-1">TDA Dynamics Simulation</p>
+        <p>Particles: <span id="nParticles"></span></p>
+        <p>Target Neighbors (k): <span id="kNeighbors"></span></p>
+        <p>Use **Mouse Drag** to rotate the view.</p>
+        <p>Use **Mouse Scroll** to zoom in/out.</p>
+        <p class="mt-2 text-yellow-300">Check **Console** for Poincaré Polynomial (B₀, B₁) logs.</p>
+    </div>
+</div>
+
+<script>
+    // The Universe is 3-fold.
+    const numSpheres = 3;
+
+    // ----------------------------------------------------
+    // ## Simulation Data and Constants (Ported from Go)
+    // ----------------------------------------------------
+
+    // Global data structure mirroring Go's `SimData`
+    let simData = {
+        Particles: [],
+        Coms: [new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3()],
+        Beta0: [1, 1, 1],
+        Beta1: [0, 0, 0],
+        Connected: [true, true, true],
+        ParticleID: [],
+    };
+
+    const winWidth = 1280;
+    const winHeight = 720;
+    const nParticles = 2400; // Particle count optimized for 3 spheres
+    const pointSize = 1.5;
+
+    // Performance / Parallelism (numWorkers is conceptual in JS)
+    const particleVboSize = 6 * 4;
+    const numWorkers = 8; // Conceptual placeholder
+
+    // DDG Constants
+    const kNeighbors = 4;      // Target number of neighbors for local structure
+    const ddgRadius = 30.0;    // Interaction radius for DDG
+    const ddgSpringK = 150.0;  // Stiffness of the DDG spring
+
+    // TDA Constants (Betti-0: Component Repair)
+    const tdaClusterRadius = 150.0;        // Distance threshold for component linking
+    const tdaRestoreForce = 700.0;         // Strong force for Betti-0 repair
+    const tdaDamping = 0.618033989;        // Golden Ratio Damping (quick convergence)
+
+    // TDA Constants (Betti-1: Hole Repair / Thin-Spot)
+    const tdaBetaOneThreshold = 2;        // If neighbors < (kNeighbors - 2), trigger Beta-1 repair
+    const tdaBetaOneForceK = 300.0;       // Inward force strength for hole-filling
+    const betaOneParticleRatio = 0.01;    // If more than 1% of particles are B1-active, set B1=1
+
+    // Confinement
+    const sphereRadius = 120.0;
+    const springStrength = 22.0;
+
+    // --- Spirograph Kinematic Parameters (Hypotrochoid) ---
+    const spiroR = 180.0;
+    const spiroK = 0.531; // k = r/R
+    const spiroL = 0.854; // l = rho/r
+    const spiroSpeed = 0.8;
+
+    // Inter-Sphere Repulsion
+    const repulsionK = 120.0;
+    const repulsionDistCheck = 300.0;
+
+    // Logging
+    const logIntervalSeconds = 5.0;
+
+    let timeAccumulator = 0.0;
+    let logTimer = 0.0;
+
+    // Camera Controls (adapted for THREE.js orbit)
+    let azimuth = 0.6, elevation = 0.2;
+    let distance = 700.0;
+    let lastX = 0, lastY = 0;
+    let dragging = false;
+
+    // Three.js Setup
+    let scene, camera, renderer, particlesGeometry, particlesMaterial, particleSystem;
+
+    // ----------------------------------------------------
+    // ## Performance Optimization Structures (Spatial Hashing)
+    // ----------------------------------------------------
+
+    class SpatialHash {
+        constructor(particles, maxRadius) {
+            this.Grid = new Map();
+            this.CellSize = maxRadius;
+            this.InvCellSize = 1.0 / maxRadius;
+            this.Update(particles);
+        }
+
+        // HashIndex converts a 3D position to a unique integer hash for the cell.
+        HashIndex(pos) {
+            const ix = Math.floor(pos.x * this.InvCellSize);
+            const iy = Math.floor(pos.y * this.InvCellSize);
+            const iz = Math.floor(pos.z * this.InvCellSize);
+            // These large primes help distribute the hashes uniformly
+            // Note: JS integers are 32-bit for bitwise ops, but up to 53-bit for safety
+            return ix * 73856093 + iy * 1934983 + iz * 83492791;
+        }
+
+        // Update rebuilds the hash map.
+        Update(particles) {
+            this.Grid.clear();
+            for (let i = 0; i < particles.length; i++) {
+                const p = particles[i];
+                const key = this.HashIndex(p.Pos);
+                if (!this.Grid.has(key)) {
+                    this.Grid.set(key, []);
+                }
+                this.Grid.get(key).push(i);
+            }
+        }
+
+        // FindNeighborsSH uses the Spatial Hash to only check the 27 adjacent cells.
+        FindNeighborsSH(index, pos, data, radius) {
+            const neighbors = [];
+            const radiusSq = radius * radius;
+
+            // Determine the grid coordinates of the particle's cell
+            const ix0 = Math.floor(pos.x * this.InvCellSize);
+            const iy0 = Math.floor(pos.y * this.InvCellSize);
+            const iz0 = Math.floor(pos.z * this.InvCellSize);
+
+            // Iterate through the 3x3x3 cell neighborhood (27 cells)
+            for (let dx = -1; dx <= 1; dx++) {
+                for (let dy = -1; dy <= 1; dy++) {
+                    for (let dz = -1; dz <= 1; dz++) {
+
+                        // Recalculate the key for the adjacent cell (must match HashIndex logic)
+                        const key = (ix0 + dx) * 73856093 + (iy0 + dy) * 1934983 + (iz0 + dz) * 83492791;
+
+                        if (this.Grid.has(key)) {
+                            const bucket = this.Grid.get(key);
+                            for (const otherIndex of bucket) {
+                                if (otherIndex === index) {
+                                    continue; // Don't check against self
+                                }
+                                // Final distance check for precision
+                                const distSq = pos.distanceToSquared(data[otherIndex].Pos);
+                                if (distSq < radiusSq) {
+                                    neighbors.push(otherIndex);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return neighbors;
+        }
+    }
+
+    // ----------------------------------------------------
+    // ## Topological Analysis Structure (Union-Find for Betti-0)
+    // ----------------------------------------------------
+
+    class UnionFind {
+        constructor(n) {
+            this.Parent = new Array(n).fill(0).map((_, i) => i); // Parent[i] is the parent of node i
+            this.Size = new Array(n).fill(1); // Size[i] stores the size of the tree rooted at i
+        }
+
+        // Find with Path Compression
+        Find(i) {
+            if (this.Parent[i] === i) {
+                return i;
+            }
+            // Path compression
+            this.Parent[i] = this.Find(this.Parent[i]);
+            return this.Parent[i];
+        }
+
+        // Union by Size
+        Union(i, j) {
+            let rootI = this.Find(i);
+            let rootJ = this.Find(j);
+            if (rootI !== rootJ) {
+                // Union by size heuristic
+                if (this.Size[rootI] < this.Size[rootJ]) {
+                    [rootI, rootJ] = [rootJ, rootI];
+                }
+                this.Parent[rootJ] = rootI;
+                this.Size[rootI] += this.Size[rootJ];
+            }
+        }
+    }
+
+    // ----------------------------------------------------
+    // ## Main and Setup
+    // ----------------------------------------------------
+
+    function init() {
+        // Init Three.js
+        const container = document.getElementById('simulation-container');
+        camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 5000);
+        scene = new THREE.Scene();
+        renderer = new THREE.WebGLRenderer({ antialias: true });
+
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        container.appendChild(renderer.domElement);
+
+        window.addEventListener('resize', onWindowResize);
+
+        // --- Particle Initialization (Triple Spheres) ---
+        simData.ParticleID = new Array(nParticles);
+        const initialCenter = new THREE.Vector3(0, 0, 0);
+
+        for (let i = 0; i < nParticles; i++) {
+            const sphereID = i % numSpheres; // Assign ID 0, 1, or 2
+            simData.ParticleID[i] = sphereID;
+
+            // Color Coding: Red, Blue, Green
+            let color = new THREE.Color(1.0, 0.2, 0.2); // Red (0)
+            if (sphereID === 1) {
+                color = new THREE.Color(0.2, 0.2, 1.0); // Blue (1)
+            } else if (sphereID === 2) {
+                color = new THREE.Color(0.2, 1.0, 0.2); // Green (2)
+            }
+
+            // Scatter particles tightly around the target sphere surface
+            const jitter = 5.0;
+            const dist = sphereRadius + (Math.random() * 2 - 1) * jitter;
+
+            const angle1 = Math.random() * 2 * Math.PI;
+            const angle2 = Math.random() * Math.PI;
+
+            const posOffset = new THREE.Vector3(
+                dist * Math.cos(angle1) * Math.sin(angle2),
+                dist * Math.sin(angle1) * Math.sin(angle2),
+                dist * Math.cos(angle2)
+            );
+
+            simData.Particles.push({
+                Pos: initialCenter.clone().add(posOffset),
+                Vel: new THREE.Vector3(
+                    (Math.random() * 2 - 1) * 2,
+                    (Math.random() * 2 - 1) * 2,
+                    (Math.random() * 2 - 1) * 2
+                ),
+                Col: color,
+            });
+        }
+
+        // --- Three.js Particle System Setup ---
+        particlesGeometry = new THREE.BufferGeometry();
+        const positions = new Float32Array(nParticles * 3);
+        const colors = new Float32Array(nParticles * 3);
+
+        particlesGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3).setUsage(THREE.DynamicDrawUsage));
+        particlesGeometry.setAttribute('color', new THREE.BufferAttribute(colors, 3).setUsage(THREE.DynamicDrawUsage));
+
+        particlesMaterial = new THREE.PointsMaterial({
+            size: pointSize,
+            vertexColors: true,
+            transparent: true,
+            blending: THREE.AdditiveBlending
+        });
+
+        particleSystem = new THREE.Points(particlesGeometry, particlesMaterial);
+        scene.add(particleSystem);
+
+        // Initial camera position
+        updateCamera();
+
+        // Setup mouse listeners (using DOM events instead of GLFW)
+        renderer.domElement.addEventListener('mousedown', mouseButton);
+        window.addEventListener('mouseup', mouseButton);
+        renderer.domElement.addEventListener('mousemove', mouseMove);
+        renderer.domElement.addEventListener('wheel', scrollCallback);
+
+        // UI Information
+        document.getElementById('nParticles').textContent = nParticles;
+        document.getElementById('kNeighbors').textContent = kNeighbors;
+
+        // Start the simulation loop
+        animate();
+    }
+
+    function onWindowResize() {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+
+    // ----------------------------------------------------
+    // ## Spirograph Kinematics (Three-Body Entanglement)
+    // ----------------------------------------------------
+
+    let prevTime = performance.now() / 1000;
+
+    function updateSphereCenters(dt) {
+        timeAccumulator += dt;
+        const t = timeAccumulator * spiroSpeed;
+
+        const R = spiroR;
+        const k = spiroK;
+        const l = spiroL;
+        const ratioTerm = (1.0 - k) / k;
+
+        // Spirograph Path (Base X/Y)
+        const term1_x = R * (1.0 - k) * Math.cos(t);
+        const term1_y = R * (1.0 - k) * Math.sin(t);
+        const term2_x = R * l * k * Math.cos(ratioTerm * t);
+        const term2_y = R * l * k * Math.sin(ratioTerm * t);
+
+        const x_base = term1_x + term2_x;
+        const y_base = term1_y - term2_y;
+
+        // Oscillation terms
+        const z_osc1 = R * 0.2 * Math.sin(t * 0.5);
+        const z_osc2 = R * 0.2 * Math.cos(t * 0.5);
+        const xy_osc = R * 0.1 * Math.sin(t);
+
+        // --- Assign Center Targets (3 Bodies) ---
+
+        // Sphere 0 (Red): Base path + Z oscillation 1
+        const xA = x_base + xy_osc;
+        const yA = y_base;
+        const zA = z_osc1;
+        simData.Coms[0].set(xA, yA, zA);
+
+        // Sphere 1 (Blue): Mirrored path + Z oscillation 2
+        const xB = -x_base;
+        const yB = -y_base + xy_osc;
+        const zB = -z_osc2;
+        simData.Coms[1].set(xB, yB, zB);
+
+        // Sphere 2 (Green): Perpendicular/Out-of-Plane Motion
+        const xC = R * 0.6 * Math.cos(t * 1.5);
+        const yC = R * 0.6 * Math.sin(t * 1.5);
+        const zC = R * 0.4 * Math.sin(t * 0.7);
+        simData.Coms[2].set(xC, yC, zC);
+    }
+
+    // ----------------------------------------------------
+    // ## High-Performance Dynamics Loop (The Calculation)
+    // ----------------------------------------------------
+
+    function updateParticlesPerformant(dt) {
+        const dt32 = dt;
+        const dampingMultiplier = 1.0 - tdaDamping;
+        const particles = simData.Particles;
+
+        // STEP 0: UPDATE DYNAMIC CENTER TARGETS (The Spirograph motion)
+        updateSphereCenters(dt);
+
+        // Step 1: TDA/Topological Analysis (β0 check)
+        const actualCOMs = [new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3()];
+        TopologicalAnalysisModule(particles, simData.ParticleID, actualCOMs, simData.Connected, simData.Beta0);
+
+        // Step 2: Rebuild Spatial Hash (O(N) operation)
+        const sh = new SpatialHash(particles, ddgRadius);
+
+        // Worker results placeholder (not used for actual threading, but maintains Go structure)
+        const localBetaOneActiveCounts = [0, 0, 0];
+
+        // -----------------------------------------------------------------
+        // Step 3: DDG/TDA Physics Integration (Sequential Loop)
+        // -----------------------------------------------------------------
+
+        // Temporary vectors used inside the loop to avoid excessive object creation
+        const tempDDG = new THREE.Vector3();
+        const tempBetaOne = new THREE.Vector3();
+        const tempCenter = new THREE.Vector3();
+        const tempRepulsion = new THREE.Vector3();
+        const tempTDA = new THREE.Vector3();
+        const tempAcc = new THREE.Vector3();
+
+        for (let i = 0; i < nParticles; i++) {
+            const p = particles[i];
+            const pos = p.Pos;
+            const sphereID = simData.ParticleID[i];
+
+            const targetCenter = simData.Coms[sphereID];
+            const isConnected = simData.Connected[sphereID];
+
+            // 1. DDG Force and Betti-1 Check (Local Surface Maintenance and Hole Repair)
+            const [ddgForce, betaOneForce, betaOneActive] = getDDGAndBetaOneForce(i, pos, sh, particles, tempDDG, tempBetaOne);
+            if (betaOneActive) {
+                localBetaOneActiveCounts[sphereID]++;
+            }
+
+            // 2. Spring Force (Kinematic Confinement)
+            const centerForce = getSphereSpringForce(pos, targetCenter, sphereRadius, tempCenter);
+
+            // 3. TDA Betti-0 Restoring Force (Topology Repair)
+            const tdaForce = tempTDA.set(0, 0, 0);
+            if (!isConnected) {
+                // Apply force towards the actual Center of Mass to reform the cluster
+                const actualCOM = actualCOMs[sphereID];
+                const distToCOM = actualCOM.distanceTo(pos);
+
+                tdaForce.subVectors(actualCOM, pos).normalize();
+                // Force scales with distance from actual COM to restore the cluster faster
+                tdaForce.multiplyScalar(tdaRestoreForce * (1.0 + distToCOM / sphereRadius));
+            }
+
+            // 4. Inter-Sphere Repulsion
+            const repulsionForce = tempRepulsion.set(0, 0, 0);
+            for (let otherID = 0; otherID < numSpheres; otherID++) {
+                if (otherID !== sphereID) {
+                    const otherCenter = simData.Coms[otherID];
+                    repulsionForce.add(getInterSphereRepulsion(pos, otherCenter));
+                }
+            }
+
+            // Combined Acceleration: Summation of all geometric and topological forces
+            tempAcc.copy(ddgForce).add(centerForce).add(tdaForce).add(repulsionForce).add(betaOneForce);
+
+            // Velocity and Position Update (Verlet Integration proxy)
+            p.Vel.add(tempAcc.multiplyScalar(dt32));
+            p.Vel.multiplyScalar(dampingMultiplier); // High damping ensures stability
+            p.Pos.add(p.Vel.clone().multiplyScalar(dt32));
+        }
+
+        // Step 4: Aggregate Results and Calculate Global Betti-1 Proxy
+        const betaOneActiveCounts = localBetaOneActiveCounts; // Since we don't have workers
+
+        for (let id = 0; id < numSpheres; id++) {
+            // Calculate the Betti-1 approximation
+            const totalParticlesInSphere = nParticles / numSpheres;
+            if (betaOneActiveCounts[id] > totalParticlesInSphere * betaOneParticleRatio) {
+                simData.Beta1[id] = 1; // Thin-spot/hole proxy is active
+            } else {
+                simData.Beta1[id] = 0; // Structure is locally stable
+            }
+        }
+
+        // Log the current topological state periodically
+        logTimer += dt32;
+        if (logTimer >= logIntervalSeconds) {
+            logTimer = 0;
+            logPoincarePolynomials();
+        }
+    }
+
+    // Logs the current Poincaré polynomial approximation for all three spheres.
+    function logPoincarePolynomials() {
+        const colors = ["Red", "Blue", "Green"];
+        console.log("--- Topological Signature (Poincaré Polynomial P(x) = b₀ + b₁x) ---");
+
+        for (let i = 0; i < numSpheres; i++) {
+            const b0 = simData.Beta0[i];
+            const b1 = simData.Beta1[i];
+
+            // Ideal S^2: P(x) = 1 + x^2. Our approximation: P(x) ≈ b_0 + b_1*x
+            let poly = `${b0}`;
+            if (b1 > 0) {
+                poly += ` + ${b1} x`;
+            }
+
+            let status = "Ideal";
+            if (b0 > 1) {
+                status = "CRITICAL (Fragmented)";
+            } else if (b1 > 0) {
+                status = "WARNING (Thin-Spot)";
+            }
+
+            // Use console.group for cleaner output if desired
+            console.log(`[${colors[i]} Sphere] P(x) = ${poly} | Status: ${status}`);
+        }
+    }
+
+    // ----------------------------------------------------
+    // ## Force Modules (DDG & Betti-1)
+    // ----------------------------------------------------
+
+    // Reusing temporary vectors to reduce garbage collection overhead
+    const tempVec = new THREE.Vector3();
+    const sumPosTemp = new THREE.Vector3();
+    const CoNTemp = new THREE.Vector3();
+
+    // getDDGAndBetaOneForce calculates the local DDG force and the Betti-1 hole-filling force.
+    function getDDGAndBetaOneForce(index, pos, sh, data, ddgForceOut, betaOneForceOut) {
+        // 1. Find Neighbors
+        const neighbors = sh.FindNeighborsSH(index, pos, data, ddgRadius);
+        const numNeighbors = neighbors.length;
+
+        if (numNeighbors === 0) {
+            ddgForceOut.set(0, 0, 0);
+            betaOneForceOut.set(0, 0, 0);
+            return [ddgForceOut, betaOneForceOut, false];
+        }
+
+        // 2. Calculate DDG Force (Local Surface Maintenance)
+        const totalForce = tempVec.set(0, 0, 0);
+        // Target distance is scaled to favor a denser local structure
+        const targetDist = ddgRadius / Math.sqrt(kNeighbors) * 0.7;
+
+        for (const neighborIndex of neighbors) {
+            const neighborPos = data[neighborIndex].Pos;
+            const vec = neighborPos.clone().sub(pos);
+            const dist = vec.length();
+            const forceMag = ddgSpringK * (dist - targetDist);
+
+            if (dist > 0.001) {
+                const dir = vec.normalize();
+                // DDG force is distributed among neighbors (div by 2.0)
+                totalForce.add(dir.multiplyScalar(forceMag * 0.5));
+            }
+        }
+        // Average force contribution from all neighbors
+        ddgForceOut.copy(totalForce).multiplyScalar(1.0 / numNeighbors);
+
+        // 3. Betti-1 Check (Hole/Thin-Spot Detection and Repair)
+        betaOneForceOut.set(0, 0, 0);
+        let betaOneActive = false;
+
+        // If local neighbor count is critically low
+        if (numNeighbors < kNeighbors - tdaBetaOneThreshold) {
+
+            // Calculate the local Center of Neighbors (CoN)
+            sumPosTemp.set(0, 0, 0);
+            for (const nIndex of neighbors) {
+                sumPosTemp.add(data[nIndex].Pos);
+            }
+            const CoN = CoNTemp.copy(sumPosTemp).multiplyScalar(1.0 / numNeighbors);
+
+            // Force direction: from the particle towards the CoN.
+            // Attempts to 'tuck' the particle inwards to thicken the surface and close the gap.
+            betaOneForceOut.subVectors(CoN, pos).normalize().multiplyScalar(tdaBetaOneForceK);
+            betaOneActive = true;
+        }
+
+        return [ddgForceOut, betaOneForceOut, betaOneActive];
+    }
+
+    // Confinement force: pulls particle toward its moving sphere's target center.
+    function getSphereSpringForce(pos, center, targetRadius, out) {
+        const vec = out.subVectors(pos, center);
+        const dist = vec.length();
+
+        if (dist < 0.001) {
+            return out.set(0, 0, 0);
+        }
+
+        const dir = vec.normalize();
+        // Force is proportional to the deviation from the target radius
+        const force = springStrength * (dist - targetRadius);
+        return dir.multiplyScalar(-force); // Negative force pulls it back
+    }
+
+    // Repulsion force between a particle and the OTHER sphere's center.
+    function getInterSphereRepulsion(pos, otherCenter) {
+        const vec = pos.clone().sub(otherCenter);
+        const dist = vec.length();
+
+        if (dist > repulsionDistCheck) {
+            return new THREE.Vector3(0, 0, 0);
+        }
+
+        // Inverse distance squared falloff for repulsion: F = k / d^2
+        const forceMag = repulsionK / (dist * dist);
+        const dir = vec.normalize();
+
+        return dir.multiplyScalar(forceMag);
+    }
+
+    // ----------------------------------------------------
+    // ## TDA Module (Betti-0: Connected Components)
+    // ----------------------------------------------------
+
+    function TopologicalAnalysisModule(data, ids, coms, connected, beta0) {
+        // Group particles by sphere ID (0, 1, or 2)
+        const groups = [[], [], []];
+        for (let i = 0; i < ids.length; i++) {
+            groups[ids[i]].push(i);
+        }
+
+        // 1. Calculate Center of Mass (COM) for each sphere (Actual COM)
+        const sumCom = [new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3()];
+        const counts = [0, 0, 0];
+
+        for (let i = 0; i < data.length; i++) {
+            const id = ids[i];
+            sumCom[id].add(data[i].Pos);
+            counts[id]++;
+        }
+
+        for (let i = 0; i < numSpheres; i++) {
+            if (counts[i] > 0) {
+                coms[i].copy(sumCom[i]).multiplyScalar(1.0 / counts[i]);
+            } else {
+                coms[i].set(0, 0, 0);
+            }
+        }
+
+        // 2. Betti-0 Connectivity Check (Union-Find)
+        const radiusSq = 0.25 * tdaClusterRadius * tdaClusterRadius;
+
+        for (let sphereID = 0; sphereID < numSpheres; sphereID++) {
+            const group = groups[sphereID];
+            if (group.length <= 1) {
+                connected[sphereID] = true;
+                beta0[sphereID] = 1;
+                continue;
+            }
+
+            // Map global particle index to local Union-Find index
+            const indexMap = new Map();
+            for (let localIdx = 0; localIdx < group.length; localIdx++) {
+                indexMap.set(group[localIdx], localIdx);
+            }
+
+            const uf = new UnionFind(group.length);
+
+            // O(N^2) check within the group
+            for (let i = 0; i < group.length; i++) {
+                const p1GlobalIdx = group[i];
+                const p1Pos = data[p1GlobalIdx].Pos;
+
+                for (let j = i + 1; j < group.length; j++) {
+                    const p2GlobalIdx = group[j];
+                    const p2Pos = data[p2GlobalIdx].Pos;
+
+                    if (p1Pos.distanceToSquared(p2Pos) < radiusSq) {
+                        uf.Union(indexMap.get(p1GlobalIdx), indexMap.get(p2GlobalIdx));
+                    }
+                }
+            }
+
+            // Count components (Betti-0)
+            let numComponents = 0;
+            for (let i = 0; i < group.length; i++) {
+                if (uf.Parent[i] === i) {
+                    numComponents++;
+                }
+            }
+            // Update the Betti-0 count
+            beta0[sphereID] = numComponents;
+            // The sphere is broken if Betti-0 > 1
+            connected[sphereID] = (numComponents <= 1);
+        }
+    }
+
+
+    // ----------------------------------------------------
+    // ## Rendering and Camera
+    // ----------------------------------------------------
+
+    function updateCamera() {
+        const x = distance * Math.cos(azimuth) * Math.cos(elevation);
+        const y = distance * Math.sin(elevation);
+        const z = distance * Math.sin(azimuth) * Math.cos(elevation);
+
+        camera.position.set(x, y, z);
+        camera.lookAt(new THREE.Vector3(0, 0, 0));
+        camera.updateProjectionMatrix();
+    }
+
+    function render() {
+        // Prepare VBO Data (update BufferGeometry attributes)
+        const positions = particlesGeometry.attributes.position.array;
+        const colors = particlesGeometry.attributes.color.array;
+
+        for (let i = 0; i < nParticles; i++) {
+            const p = simData.Particles[i];
+            const i3 = i * 3;
+
+            // Position
+            positions[i3] = p.Pos.x;
+            positions[i3 + 1] = p.Pos.y;
+            positions[i3 + 2] = p.Pos.z;
+
+            // Color
+            colors[i3] = p.Col.r;
+            colors[i3 + 1] = p.Col.g;
+            colors[i3 + 2] = p.Col.b;
+        }
+
+        particlesGeometry.attributes.position.needsUpdate = true;
+        particlesGeometry.attributes.color.needsUpdate = true;
+
+        renderer.render(scene, camera);
+    }
+
+    function animate() {
+        requestAnimationFrame(animate);
+
+        const currentTime = performance.now() / 1000;
+        const dt = currentTime - prevTime;
+        prevTime = currentTime;
+
+        updateParticlesPerformant(dt);
+        render();
+    }
+
+    // --- Input Handlers (Ported from Go-GLFW to DOM) ---
+
+    function mouseMove(event) {
+        if (dragging) {
+            const deltaX = event.clientX - lastX;
+            const deltaY = event.clientY - lastY;
+
+            azimuth -= deltaX * 0.005;
+            elevation -= deltaY * 0.005;
+
+            // Clamp elevation
+            elevation = Math.max(-1.4, Math.min(1.4, elevation));
+            updateCamera();
+        }
+        lastX = event.clientX;
+        lastY = event.clientY;
+    }
+
+    function mouseButton(event) {
+        // event.button === 0 is the left mouse button
+        if (event.type === 'mousedown' && event.button === 0) {
+            dragging = true;
+        } else if (event.type === 'mouseup') {
+            dragging = false;
+        }
+    }
+
+    function scrollCallback(event) {
+        // event.deltaY is the scroll amount
+        distance += event.deltaY * 0.5; // Adjusted sensitivity
+        distance = Math.max(200, Math.min(3000, distance));
+        updateCamera();
+    }
+
+    // Initialize the application when the window loads
+    window.onload = init;
+
+</script>
+</body>
+</html>
